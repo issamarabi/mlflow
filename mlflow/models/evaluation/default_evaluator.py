@@ -8,6 +8,7 @@ import pickle
 import shutil
 import tempfile
 import time
+import inspect
 from collections import namedtuple
 from functools import partial
 from typing import Callable, Dict, NamedTuple
@@ -497,17 +498,18 @@ def _is_numeric(value):
     return isinstance(value, (int, float, np.number))
 
 
-def _evaluate_custom_metric(custom_metric_tuple, eval_df, builtin_metrics, metrics):
+def _evaluate_custom_metric(custom_metric_tuple, eval_fn_args, eval_fn_kwargs, is_old_signature):
     """
     This function calls the `custom_metric` function and performs validations on the returned
     result to ensure that they are in the expected format. It will warn and will not log metrics
     that are in the wrong format.
 
     :param custom_metric_tuple: Containing a user provided function and its index in the
-                                ``custom_metrics`` parameter of ``mlflow.evaluate``
-    :param eval_df: A Pandas dataframe object containing a prediction and a target column.
-    :param builtin_metrics: A dictionary of aggregate metrics produced by the default evaluator.
-    :param metrics: A dictionary of metric values produced by the default evaluator.
+        ``custom_metrics`` parameter of ``mlflow.evaluate``
+    :param eval_fn_args: A dictionary of args needed to compute the eval metrics.
+    :param eval_fn_kwargs: A dictionary of extra kwargs needed to compute the eval metrics.
+    :param is_old_signature: A boolean indicating whether the user provided function is using the
+        old signature or not.
     :return: MetricValue
     """
     exception_header = (
@@ -515,15 +517,32 @@ def _evaluate_custom_metric(custom_metric_tuple, eval_df, builtin_metrics, metri
         f"{custom_metric_tuple.index} in the `custom_metrics` parameter because it"
     )
 
-    metrics_type = custom_metric_tuple.function.__annotations__.get("metrics", None)
-    if metrics_type and metrics_type in (
-        Dict[str, MetricValue],
-        "Dict[str, MetricValue]",
-    ):
-        metric = custom_metric_tuple.function(eval_df, metrics)
-    else:
+    if is_old_signature:
         # use old builtin_metrics: Dict[str, float]
-        metric = custom_metric_tuple.function(eval_df, builtin_metrics)
+        metric = custom_metric_tuple.function(
+            eval_fn_args["eval_df"], eval_fn_args["_builtin_metrics"]
+        )
+    else:
+        # Create a dictionary with non-empty arguments
+        eval_args = {
+            "predictions": eval_fn_args.get("predictions"),
+            "targets": eval_fn_args.get("targets"),
+            "metrics": eval_fn_args.get("metrics"),
+            "input": eval_fn_args.get("input"),
+            **eval_fn_kwargs,
+        }
+
+        # Filter out None values
+        eval_args = {k: v for k, v in eval_args.items() if v is not None}
+        metric = builtin_metric.eval_fn(**eval_args)
+
+        metric = custom_metric_tuple.function(
+            eval_fn_args["predictions"],
+            eval_fn_args["targets"],
+            eval_fn_args["metrics"],
+            eval_fn_args["input"],
+            **eval_fn_kwargs,
+        )
 
     if metric is None:
         _logger.warning(f"{exception_header} returned None.")
@@ -1110,37 +1129,65 @@ class DefaultEvaluator(ModelEvaluator):
         artifact._load(artifact_file_local_path)
         return artifact
 
+    def _get_args_for_metrics(self, custom_metric, eval_df):
+        # deepcopying eval_df and builtin_metrics for each custom metric function call,
+        # in case the user modifies them inside their function(s).
+        eval_df_copy = eval_df.copy()
+        input_df = self.X.copy_to_avoid_mutation()
+        parameters = inspect.signature(custom_metric.eval_fn).parameters
+        eval_fn_args = {}
+        eval_fn_kwargs = {}
+        is_old_signature = False
+        if "eval_df" in parameters:
+            eval_fn_args["eval_df"] = eval_df_copy
+            if "_builtin_metrics" in parameters:
+                eval_fn_args["_builtin_metrics"] = copy.deepcopy(self.metrics)
+            is_old_signature = True
+        else:
+            is_old_signature = False
+            if "predicitons" in parameters:
+                eval_fn_args["predictions"] = eval_df_copy["predictions"]
+                del parameters["predicitons"]
+            if "targets" in parameters:
+                eval_fn_args["targets"] = eval_df_copy["targets"]
+                del parameters["targets"]
+            if "metrics" in parameters:
+                eval_fn_args["metrics"] = copy.deepcopy(self.metrics_values)
+                del parameters["metrics"]
+            if "input" in parameters:
+                input_df_columns = input_df.columns
+                input_column_name = self.evaluator_config.get("input", "input")
+
+                if input_column_name in input_df_columns:
+                    eval_fn_args["input"] = input_df[input_column_name]
+                    del parameters["input"]
+
+            # Rest are all parameters are args that are used to compute the metric.
+            for param_name, param in parameters.items():
+                column = self.evaluator_config.get(param_name, param_name)
+                if not isinstance(column, str):
+                    eval_fn_kwargs[param_name] = column
+                if column in input_df.columns:
+                    eval_fn_kwargs[param_name] = input_df[column]
+                elif (
+                    self.other_output_columns is not None
+                    and column in self.other_output_columns.columns
+                ):
+                    eval_fn_kwargs[param_name] = self.other_output_columns[column]
+                elif param.default == inspect.Parameter.empty:
+                    raise MlflowException(
+                        f"Column '{param_name}' not found in input data or output data."
+                    )
+
+        return eval_fn_args, eval_fn_kwargs, is_old_signature
+
     def _evaluate_custom_metrics(self, eval_df):
         if not self.custom_metrics:
             return
         for index, custom_metric in enumerate(self.custom_metrics):
-            # deepcopying eval_df and builtin_metrics for each custom metric function call,
-            # in case the user modifies them inside their function(s).
-            eval_df_copy = eval_df.copy()
-            variables = custom_metric.variables
-            input_df = self.X.copy_to_avoid_mutation()
-
-            if variables is not None:
-                for variable in variables:
-                    column_name = self.evaluator_config.get(variable, variable)
-                    if column_name in input_df.columns:
-                        eval_df_copy[column_name] = input_df[column_name]
-                    elif (
-                        self.other_output_columns is not None
-                        and column_name in self.other_output_columns.columns
-                    ):
-                        eval_df_copy[column_name] = self.other_output_columns[column_name]
-                    else:
-                        raise MlflowException(
-                            f"Column '{column_name}' not found in input data or output data."
-                        )
-
-            input_df_columns = input_df.columns
-            input_column_name = self.evaluator_config.get("input", "input")
-
-            if input_column_name in input_df_columns:
-                eval_df_copy["input"] = input_df[input_column_name]
-
+            eval_fn_args, eval_fn_kwargs, is_old_signature = self._get_args_for_metrics(
+                custom_metric, eval_df
+            )
             _logger.info("Evaluating custom metrics:", custom_metric.name)
             custom_metric_tuple = _CustomMetric(
                 function=custom_metric.eval_fn,
@@ -1148,10 +1195,7 @@ class DefaultEvaluator(ModelEvaluator):
                 name=custom_metric.name,
             )
             metric_value = _evaluate_custom_metric(
-                custom_metric_tuple,
-                eval_df_copy,
-                copy.deepcopy(self.metrics),
-                copy.deepcopy(self.metrics_values),
+                custom_metric_tuple, eval_fn_args, eval_fn_kwargs, is_old_signature
             )
             if metric_value:
                 name = (
@@ -1374,7 +1418,29 @@ class DefaultEvaluator(ModelEvaluator):
             return
         for builtin_metric in self.builtin_metrics:
             _logger.info("Evaluating builtin metrics:", builtin_metric.name)
-            metric_value = builtin_metric.eval_fn(eval_df, self.metrics)
+            eval_fn_args, eval_fn_kwargs, is_old_signature = self._get_args_for_metrics(
+                builtin_metric, eval_df
+            )
+
+            if is_old_signature:
+                metric_value = builtin_metric.eval_fn(
+                    eval_fn_args["eval_df"], eval_fn_args.get("_builtin_metrics", {})
+                )
+            else:
+                # Create a dictionary with non-empty arguments
+                eval_args = {
+                    "predictions": eval_fn_args.get("predictions"),
+                    "targets": eval_fn_args.get("targets"),
+                    "metrics": eval_fn_args.get("metrics"),
+                    "input": eval_fn_args.get("input"),
+                    **eval_fn_kwargs,
+                }
+
+                # Filter out None values
+                eval_args = {k: v for k, v in eval_args.items() if v is not None}
+
+                metric = builtin_metric.eval_fn(**eval_args)
+
             if metric_value:
                 name = (
                     f"{builtin_metric.name}/{builtin_metric.version}"
