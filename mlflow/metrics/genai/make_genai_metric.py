@@ -2,7 +2,8 @@ import json
 import logging
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from inspect import Parameter, Signature
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from mlflow.exceptions import MlflowException
 from mlflow.metrics.base import EvaluationExample, MetricValue
@@ -14,7 +15,6 @@ from mlflow.utils.class_utils import _get_class_from_string
 
 if TYPE_CHECKING:
     import pandas as pd
-    import pyspark
 
 _logger = logging.getLogger(__name__)
 
@@ -26,7 +26,7 @@ def _format_variable_string(variables: Optional[List[str]], eval_variables, indx
             variables_dict[variable] = eval_variables[variable][indx]
         else:
             raise MlflowException(
-                f"{variable} does not exist in the Eval Dictionary {list(eval_variables.keys())}."
+                f"{variable} does not exist in the eval function {list(eval_variables.keys())}."
             )
 
     return (
@@ -168,19 +168,17 @@ def make_genai_metric(
         )
     """
 
-    def eval_inner_fn(
+    def eval_fn(
         predictions: "pd.Series",
-        targets: "pd.Series",
         metrics: Dict[str, MetricValue],
         input: "pd.Series",
-        **kwargs: Dict[str, Any],
+        **eval_variables,
     ) -> MetricValue:
         """
         This is the function that is called when the metric is evaluated.
         """
 
         class_name = f"mlflow.metrics.genai.prompts.{version}.EvaluationModel"
-        eval_variables = kwargs
         try:
             evaluation_model_class_module = _get_class_from_string(class_name)
         except ModuleNotFoundError:
@@ -296,18 +294,17 @@ def make_genai_metric(
 
         return MetricValue(scores, justifications, aggregate_results)
 
-    variables_function_signature = ", ".join(variables)
+    signature_parameters = [
+        Parameter("predictions", Parameter.POSITIONAL_OR_KEYWORD, annotation="pd.Series"),
+        Parameter("metrics", Parameter.POSITIONAL_OR_KEYWORD, annotation=Dict[str, MetricValue]),
+        Parameter("input", Parameter.POSITIONAL_OR_KEYWORD, annotation="pd.Series"),
+    ]
 
-    # Create the function dynamically
-    eval_fn = exec(
-        "def eval_fn(predictions: 'pd.Series', targets: 'pd.Series', "
-        "metrics: 'Dict[str, MetricValue]', input: 'pd.Series', "
-        f"{variables_function_signature}): "
-        f"eval_inner_fn(predictions, targets, metrics, input, {variables_function_signature})",
-        locals(),
-    )
+    # Add variables to signature list
+    for var in variables:
+        signature_parameters.append(Parameter(var, Parameter.POSITIONAL_OR_KEYWORD))
 
-    print("eval_fn", eval_fn)
+    eval_fn.__signature__ = Signature(signature_parameters)
 
     return make_metric(
         eval_fn=eval_fn, greater_is_better=greater_is_better, name=name, version=version

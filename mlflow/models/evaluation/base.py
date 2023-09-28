@@ -14,7 +14,7 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from decimal import Decimal
 from types import FunctionType
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict
 
 import mlflow
 from mlflow.data.dataset import Dataset
